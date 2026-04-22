@@ -1,0 +1,18 @@
+Connect-ExchangeOnline
+
+$aliasDomain = "@domain.se"
+
+$users = @(
+    "username@domain.se"
+)
+
+foreach ($user in $users) {
+    try {
+        $username = $user.Split("@")[0]
+        $alias = "smtp:$username$aliasDomain"
+        Set-Mailbox -Identity $user -EmailAddresses @{Add = $alias}
+        Write-Host "OK  $user → $username$aliasDomain" -ForegroundColor Green
+    } catch {
+        Write-Host "FAIL $user — $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
