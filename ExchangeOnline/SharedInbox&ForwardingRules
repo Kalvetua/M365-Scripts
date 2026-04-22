@@ -1,0 +1,236 @@
+# Kräver: ExchangeOnlineManagement + ImportExcel
+# Install-Module ImportExcel -Scope CurrentUser   (om ej installerad)
+
+$allShared = Get-EXOMailbox -RecipientTypeDetails SharedMailbox -ResultSize Unlimited `
+             -PropertySets Minimum, Delivery
+$fwdUsers  = Get-EXOMailbox -RecipientTypeDetails UserMailbox  -ResultSize Unlimited `
+             -PropertySets Minimum, Delivery |
+             Where-Object { $_.ForwardingAddress -or $_.ForwardingSmtpAddress }
+
+$targets = @($allShared) + @($fwdUsers)
+
+$typMap = @{
+    'SharedMailbox' = 'Delad brevlåda'
+    'UserMailbox'   = 'Personlig brevlåda'
+}
+
+function ToJaNej($v) { if ($v) { 'Ja' } else { 'Nej' } }
+
+$acceptedDomains = @((Get-AcceptedDomain).DomainName | ForEach-Object { $_.ToLower() })
+
+function Test-IsExternal {
+    param([string]$address)
+    if ([string]::IsNullOrWhiteSpace($address)) { return $false }
+    if ($address -match '@([^>\s]+)') {
+        $domain = $matches[1].TrimEnd('>').ToLower()
+        return -not ($acceptedDomains -contains $domain)
+    }
+    return $false
+}
+
+$recipientCache = @{}
+
+function Resolve-Recipient {
+    param([string]$raw)
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    if ($recipientCache.ContainsKey($raw)) { return $recipientCache[$raw] }
+
+    $value = $raw.Trim()
+    $result = $null
+
+    if ($value -match '^(?i)smtp:(.+)$') {
+        $result = $matches[1].Trim()
+    }
+    elseif ($value -match '^(.+?)\s*[\[<](?:SMTP:)?([^\]>]+@[^\]>]+)[\]>]\s*$') {
+        $name = $matches[1].Trim()
+        $smtp = $matches[2].Trim()
+        $normalizedName = $name.ToLower() -replace '[_\s]', ''
+        $normalizedSmtp = $smtp.ToLower() -replace '[@.\s]', ''
+        if ($normalizedName -eq $normalizedSmtp) {
+            $result = $smtp
+        } else {
+            $result = "$name <$smtp>"
+        }
+    }
+    elseif ($value -match '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        $result = $value
+    }
+    else {
+        try {
+            $rcpt = Get-EXORecipient -Identity $value -ErrorAction Stop |
+                    Select-Object -First 1
+            if ($rcpt) {
+                $smtp = $rcpt.PrimarySmtpAddress
+                $name = $rcpt.DisplayName
+                if ($smtp -and $name) {
+                    $nName = $name.ToLower() -replace '[_\s]', ''
+                    $nSmtp = $smtp.ToLower() -replace '[@.\s]', ''
+                    if ($nName -eq $nSmtp -or $name -eq $smtp) {
+                        $result = $smtp
+                    } else {
+                        $result = "$name <$smtp>"
+                    }
+                } elseif ($smtp) {
+                    $result = $smtp
+                } else {
+                    $result = $name
+                }
+            }
+        } catch {
+            $result = $value
+        }
+    }
+
+    $recipientCache[$raw] = $result
+    return $result
+}
+
+$report = @(
+    foreach ($mbx in $targets) {
+        $rules = Get-InboxRule -Mailbox $mbx.UserPrincipalName -ErrorAction SilentlyContinue |
+                 Where-Object { $_.ForwardTo -or $_.ForwardAsAttachmentTo -or $_.RedirectTo }
+
+        $harMbxForward        = [bool]($mbx.ForwardingAddress -or $mbx.ForwardingSmtpAddress)
+        $harVidarebefordran   = [bool]($harMbxForward -or $rules)
+
+        $hurInstallt = switch ($true) {
+            ($mbx.ForwardingAddress -and $mbx.ForwardingSmtpAddress) { 'Inställt på två sätt samtidigt' }
+            ([bool]$mbx.ForwardingAddress)     { 'Till någon inom företaget' }
+            ([bool]$mbx.ForwardingSmtpAddress) { 'Till en e-postadress' }
+            ($rules.Count -gt 0)               { 'Via regel i inkorgen' }
+            default                            { 'Ingen vidarebefordran' }
+        }
+
+        $raw = @()
+        if ($mbx.ForwardingAddress)     { $raw += [string]$mbx.ForwardingAddress }
+        if ($mbx.ForwardingSmtpAddress) { $raw += [string]$mbx.ForwardingSmtpAddress }
+        $raw += @($rules | ForEach-Object {
+                     @($_.ForwardTo) + @($_.ForwardAsAttachmentTo) + @($_.RedirectTo)
+                 } | Where-Object { $_ } | ForEach-Object { [string]$_ })
+
+        $mottagare = @($raw | ForEach-Object { Resolve-Recipient $_ } |
+                       Where-Object { $_ } |
+                       Select-Object -Unique)
+
+        $externt = $false
+        foreach ($a in $raw) {
+            $addr = if ($a -match '([^<\[\s:]+@[^>\]\s]+)') { $matches[1] } else { $a }
+            if (Test-IsExternal $addr) { $externt = $true; break }
+        }
+
+        $externText = if (-not $harVidarebefordran) { '' }
+                      elseif ($externt)             { 'Ja – till extern adress' }
+                      else                          { 'Nej – stannar inom företaget' }
+
+        $sparas = if (-not $harVidarebefordran) {
+            ''
+        } elseif ($harMbxForward) {
+            if ($mbx.DeliverToMailboxAndForward) { 'Ja – kopia stannar i brevlådan' }
+            else                                 { 'Nej – försvinner efter vidarebefordran' }
+        } else {
+            # Endast inbox-regel utan mailbox-forward: ForwardTo behåller kopia, RedirectTo gör inte
+            $harRedirect = [bool]($rules | Where-Object { $_.RedirectTo })
+            if ($harRedirect -and -not ($rules | Where-Object { $_.ForwardTo -or $_.ForwardAsAttachmentTo })) {
+                'Nej – regeln omdirigerar utan att spara'
+            } else {
+                'Ja – kopia stannar i brevlådan'
+            }
+        }
+
+        [PSCustomObject]@{
+            'Brevlåda'                     = [string]$mbx.UserPrincipalName
+            'Typ'                          = $typMap[$mbx.RecipientTypeDetails.ToString()]
+            'Är vidarebefordran på'        = ToJaNej $harVidarebefordran
+            'Går mejlen utanför företaget' = $externText
+            'Hur är det inställt'          = $hurInstallt
+            'Mottagare'                    = $mottagare -join '; '
+            'Sparas en kopia'              = $sparas
+            'Antal regler i inkorgen'      = ($rules | Measure-Object).Count
+        }
+    }
+)
+
+Write-Host "Bygger rapport: $($report.Count) rader" -ForegroundColor Cyan
+if ($report.Count -eq 0) {
+    Write-Warning "Inget att exportera."
+    return
+}
+
+# -----------------------------------------------------------------------------
+$tenant    = (Get-AcceptedDomain | Where-Object Default).DomainName
+$timestamp = Get-Date -Format 'yyyy-MM-dd_HHmm'
+$xlsxPath  = Join-Path $PWD "Vidarebefordringsrapport_${tenant}_${timestamp}.xlsx"
+if (Test-Path $xlsxPath) { Remove-Item $xlsxPath -Force }
+
+$sorted = @($report | Sort-Object Typ, Brevlåda)
+
+$excel = $sorted | Export-Excel -Path $xlsxPath `
+    -WorksheetName 'Vidarebefordran' `
+    -TableName    'Vidarebefordran' `
+    -TableStyle   Medium2 `
+    -AutoSize `
+    -FreezeTopRow `
+    -BoldTopRow `
+    -PassThru
+
+$ws = $excel.Workbook.Worksheets['Vidarebefordran']
+
+# Mottagarkolumnen: bred, utan radbryt — långa listor klipps visuellt, hela texten finns kvar
+$ws.Column(6).Width = 60
+$ws.Column(6).Style.WrapText = $false
+
+$dataStart = 2
+$dataEnd   = $ws.Dimension.End.Row
+$lastCol   = $ws.Dimension.End.Address -replace '\d'
+
+if ($dataEnd -ge $dataStart) {
+    # Gul: vidarebefordran aktiv (kolumn C)
+    Add-ConditionalFormatting -Worksheet $ws `
+        -Range           "A${dataStart}:${lastCol}${dataEnd}" `
+        -RuleType        Expression `
+        -ConditionValue  "=`$C${dataStart}=`"Ja`"" `
+        -BackgroundColor '#FFF4CE'
+
+    # Röd: innehåller "Ja" i kolumn D (går externt)
+    Add-ConditionalFormatting -Worksheet $ws `
+        -Range           "A${dataStart}:${lastCol}${dataEnd}" `
+        -RuleType        Expression `
+        -ConditionValue  "=LEFT(`$D${dataStart},2)=`"Ja`"" `
+        -BackgroundColor '#F4B6B6' `
+        -Bold
+}
+
+$explain = $excel.Workbook.Worksheets.Add('Förklaring')
+$explain.Cells[1,1].Value = "Översikt över vidarebefordran – $tenant"
+$explain.Cells[1,1].Style.Font.Bold = $true
+$explain.Cells[1,1].Style.Font.Size = 14
+$explain.Cells[2,1].Value = "Genererad $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+$explain.Cells[2,1].Style.Font.Italic = $true
+
+$rows = @(
+    @('Brevlåda',                    'E-postadressen för kontot.')
+    @('Typ',                         'Personlig = tillhör en medarbetare. Delad = används av flera, t.ex. info@ eller support@.')
+    @('Är vidarebefordran på',       'Ja betyder att inkommande mejl skickas vidare någonstans.')
+    @('Går mejlen utanför företaget','Säger Ja om mejlen skickas utanför er organisation, Nej om de stannar internt. Extern adress är alltid värt att granska.')
+    @('Hur är det inställt',         'Beskriver på vilket sätt vidarebefordran är konfigurerad.')
+    @('Mottagare',                   'Vem mejlen skickas till. Namn visas när det finns i katalogen, annars bara adressen.')
+    @('Sparas en kopia',             'Ja = mejlen ligger kvar i brevlådan också. Nej = de försvinner direkt efter vidarebefordran.')
+    @('Antal regler i inkorgen',     'Regler användaren själv skapat i Outlook. Fler än 0 är värt att titta på.')
+)
+for ($i = 0; $i -lt $rows.Count; $i++) {
+    $r = $i + 4
+    $explain.Cells[$r,1].Value = $rows[$i][0]
+    $explain.Cells[$r,1].Style.Font.Bold = $true
+    $explain.Cells[$r,2].Value = $rows[$i][1]
+    $explain.Cells[$r,2].Style.WrapText = $true
+}
+$explain.Column(1).Width = 32
+$explain.Column(2).Width = 80
+
+$legendRow = $rows.Count + 6
+$explain.Cells[$legendRow,1].Value = 'Gul rad = vidarebefordran är aktiv. Röd rad = mejl skickas utanför företaget.'
+$explain.Cells[$legendRow,1].Style.Font.Italic = $true
+
+Close-ExcelPackage $excel
+
+Write-Host "Exporterade $($sorted.Count) rader till $xlsxPath" -ForegroundColor Green
