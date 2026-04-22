@@ -1,0 +1,29 @@
+Connect-ExchangeOnline
+
+$newDomain = "domain"
+$groups = @(
+    "groupName@domain.se",
+    "groupName@domain.se"
+)
+
+foreach ($group in $groups) {
+    Write-Host "`nProcessing group: $group"
+    Get-DistributionGroupMember -Identity $group -ResultSize Unlimited |
+        Where-Object { $_.PrimarySmtpAddress -ne $null -and $_.PrimarySmtpAddress -ne "" } |
+        ForEach-Object {
+            try {
+                $mailbox = Get-Mailbox $_.PrimarySmtpAddress -ErrorAction Stop
+                $alreadyHasDomain = $mailbox.EmailAddresses | Where-Object { $_ -like "*@$newDomain" }
+                
+                if ($alreadyHasDomain) {
+                    Write-Host "Skipped $($mailbox.DisplayName) — already has $newDomain alias"
+                } else {
+                    $alias = "$($mailbox.Alias)@$newDomain"
+                    Set-Mailbox $mailbox.Identity -EmailAddresses @{Add = $alias}
+                    Write-Host "Added $alias to $($mailbox.DisplayName)"
+                }
+            } catch {
+                Write-Host "Skipped $($_.PrimarySmtpAddress) — no mailbox found"
+            }
+        }
+}
