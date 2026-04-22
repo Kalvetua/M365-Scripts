@@ -1,0 +1,1 @@
+Get-DistributionGroupMember -Identity "groupName@domän.se" | Where-Object { $_.PrimarySmtpAddress -ne $null -and $_.PrimarySmtpAddress -ne "" } | Select DisplayName, PrimarySmtpAddress, Alias
